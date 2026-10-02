@@ -953,6 +953,60 @@ fun InlineDetailVideoPlayer(
             isExtracting = true
             extractionFailed = false
 
+            val mediaId = playback.mediaId
+            val currentUser = try { com.google.firebase.auth.FirebaseAuth.getInstance().currentUser } catch (_: Throwable) { null }
+            com.example.extension.managed.trace.Phase05GLogger.log(
+                "AUTH",
+                mediaId,
+                "authenticated=${currentUser != null}, uid=${currentUser?.uid ?: "none"}, email=${currentUser?.email ?: "none"}"
+            )
+
+            val registry = com.example.extension.managed.registry.ManagedExtensionRegistry.INSTANCE
+            val allExts = registry.getAllExtensions()
+            val activeExts = registry.getActiveExtensions()
+            val eligibleMovie = activeExts.filter { it.contentTypes.contains(com.example.extension.managed.model.ContentType.MOVIE) }
+
+            com.example.extension.managed.trace.Phase05GLogger.log(
+                "FIREBASE",
+                mediaId,
+                "orchestrator initialized, activeExtensionsCount=${activeExts.size}"
+            )
+            com.example.extension.managed.trace.Phase05GLogger.log(
+                "REMOTE_COUNT",
+                mediaId,
+                "allExtensionsCount=${allExts.size}"
+            )
+            com.example.extension.managed.trace.Phase05GLogger.log(
+                "VALIDATED_COUNT",
+                mediaId,
+                "activeValidatedCount=${activeExts.size}"
+            )
+            com.example.extension.managed.trace.Phase05GLogger.log(
+                "CACHE",
+                mediaId,
+                "checking cached state for mediaKey=$currentMediaKey"
+            )
+            com.example.extension.managed.trace.Phase05GLogger.log(
+                "REGISTRY",
+                mediaId,
+                "total=${allExts.size}, ids=${allExts.map { it.id }}"
+            )
+            com.example.extension.managed.trace.Phase05GLogger.log(
+                "ACTIVE",
+                mediaId,
+                "activeCount=${activeExts.size}, ids=${activeExts.map { it.id }}"
+            )
+            com.example.extension.managed.trace.Phase05GLogger.log(
+                "ELIGIBLE_MOVIE",
+                mediaId,
+                "eligibleMovieCount=${eligibleMovie.size}, ids=${eligibleMovie.map { it.id }}"
+            )
+            com.example.extension.managed.trace.Phase05GLogger.log(
+                "SERVERSTATE",
+                mediaId,
+                "dispatching inspectAndCacheMedia for mediaKey=$currentMediaKey"
+            )
+
             // 1. If playback.url is a server link, extract from that server
             if (playback.url.isNotBlank() && !playback.url.startsWith("auto_extract://")) {
                 val serverItem = com.example.extension.managed.model.ServerItem(
@@ -969,6 +1023,11 @@ fun InlineDetailVideoPlayer(
                         playableUrl = stream
                         isExtracting = false
                         extractionFailed = false
+                        com.example.extension.managed.trace.Phase05GLogger.log(
+                            "PLAYER",
+                            mediaId,
+                            "Handoff success (server link): playableUrl=$stream"
+                        )
                         onPlaybackUrlExtracted?.invoke(stream)
                         return@LaunchedEffect
                     }
@@ -1000,6 +1059,11 @@ fun InlineDetailVideoPlayer(
                 playableUrl = stream
                 isExtracting = false
                 extractionFailed = false
+                com.example.extension.managed.trace.Phase05GLogger.log(
+                    "PLAYER",
+                    mediaId,
+                    "Handoff success: playableUrl=$stream"
+                )
                 onPlaybackUrlExtracted?.invoke(stream)
             } else {
                 // Fallback to originalTitle if not blank and different from title
@@ -1027,12 +1091,22 @@ fun InlineDetailVideoPlayer(
                         playableUrl = streamOrig
                         isExtracting = false
                         extractionFailed = false
+                        com.example.extension.managed.trace.Phase05GLogger.log(
+                            "PLAYER",
+                            mediaId,
+                            "Handoff success (originalTitle): playableUrl=$streamOrig"
+                        )
                         onPlaybackUrlExtracted?.invoke(streamOrig)
                         return@LaunchedEffect
                     }
                 }
                 isExtracting = false
                 extractionFailed = true
+                com.example.extension.managed.trace.Phase05GLogger.log(
+                    "PLAYER",
+                    mediaId,
+                    "Handoff failed: no playable stream resolved, extractionFailed=true"
+                )
             }
         }
     }

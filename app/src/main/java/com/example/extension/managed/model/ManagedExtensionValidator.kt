@@ -98,4 +98,45 @@ object ManagedExtensionValidator {
 
         return ValidationResult.Valid
     }
+
+    /**
+     * Strict remote validation gate per Phase 05G FIX 3:
+     * Verifies:
+     * - structural validity (id, baseUrl, https scheme, valid host, non-negative priority)
+     * - contentTypes non-empty
+     * - minAppVersionCode <= currentAppVersionCode
+     * - runtimeApiVersion <= supportedRuntimeApiVersion
+     * - local executable scraper exists in ScraperRegistry
+     */
+    fun validateRemoteEntry(
+        extension: ManagedExtension,
+        currentAppVersionCode: Long = 1L,
+        supportedRuntimeApiVersion: Int = 1,
+        scraperRegistry: com.example.extension.managed.registry.ScraperRegistry = com.example.extension.managed.registry.ScraperRegistry.INSTANCE
+    ): ValidationResult {
+        val structuralResult = validate(extension)
+        if (structuralResult !is ValidationResult.Valid) {
+            return structuralResult
+        }
+
+        if (extension.minAppVersionCode > currentAppVersionCode) {
+            return ValidationResult.Invalid(
+                ExtensionError.IncompatibleAppVersion(currentAppVersionCode, extension.minAppVersionCode)
+            )
+        }
+
+        if (extension.runtimeApiVersion > supportedRuntimeApiVersion) {
+            return ValidationResult.Invalid(
+                ExtensionError.IncompatibleRuntime(supportedRuntimeApiVersion, extension.runtimeApiVersion)
+            )
+        }
+
+        if (scraperRegistry.getScraper(extension.scraperKey) == null) {
+            return ValidationResult.Invalid(
+                ExtensionError.UnknownScraperKey(extension.scraperKey)
+            )
+        }
+
+        return ValidationResult.Valid
+    }
 }

@@ -1189,6 +1189,27 @@ object ServerStateStore {
             sourceUrl = existingCached.playbackPageUrl
             website = existingCached.website
             directStreamUrl = existingCached.directStreamUrl
+
+            // FIX 4: Deterministically reconstruct serverItems from cached server definitions
+            serverItems = existingCached.servers.mapNotNull { name ->
+                val link = existingCached.serverLinks[name] ?: return@mapNotNull null
+                val id = existingCached.serverIds[name] ?: name
+                val isDirect = link.endsWith(".mp4") || link.endsWith(".m3u8") || link.contains("akamaized.net")
+                com.example.extension.managed.model.ServerItem(
+                    id = id,
+                    name = name,
+                    link = link,
+                    isDirectStream = isDirect,
+                    sourceUrl = existingCached.playbackPageUrl ?: link,
+                    serverType = if (isDirect) com.example.extension.managed.model.ServerType.DIRECT else com.example.extension.managed.model.ServerType.EMBED,
+                    requiresWebView = !isDirect
+                )
+            }
+            com.example.extension.managed.trace.Phase05GLogger.log(
+                "CACHE",
+                mediaId,
+                "Cache hit: ${serversNames.size} servers cached, reconstructed ${serverItems.size} serverItems, cachedDirectStream=${!directStreamUrl.isNullOrBlank()}"
+            )
         } else {
             val managedOrchestrator = com.example.extension.orchestrator.ManagedMediaOrchestrator.getInstance(context)
             val targetType = contentType ?: when {
@@ -1196,7 +1217,17 @@ object ServerStateStore {
                 title.contains("anime", ignoreCase = true) || title.contains("أنمي", ignoreCase = true) -> com.example.extension.managed.model.ContentType.ANIME
                 else -> com.example.extension.managed.model.ContentType.SERIES
             }
+            com.example.extension.managed.trace.Phase05GLogger.log(
+                "DISCOVERY",
+                mediaId,
+                "TargetContentType=$targetType, hasActiveExtensions=${managedOrchestrator.hasActiveExtensions(targetType)}"
+            )
             if (!managedOrchestrator.hasActiveExtensions(targetType)) {
+                com.example.extension.managed.trace.Phase05GLogger.log(
+                    "DISCOVERY",
+                    mediaId,
+                    "Early return: no active extensions for targetType=$targetType"
+                )
                 return null
             }
 
@@ -1213,6 +1244,11 @@ object ServerStateStore {
             )
 
             if (outcome !is com.example.extension.orchestrator.ManagedDiscoveryOutcome.Success) {
+                com.example.extension.managed.trace.Phase05GLogger.log(
+                    "DISCOVERY",
+                    mediaId,
+                    "discoverServers outcome: ${outcome.javaClass.simpleName}"
+                )
                 return null
             }
 
@@ -1229,18 +1265,25 @@ object ServerStateStore {
             }.associate { it.name to it.link }
             sourceUrl = outcome.sourceUrl
             website = outcome.website
-            directStreamUrl = outcome.directStream?.streamUrl
+            directStreamUrl = outcome.directStream?.streamUrl?.takeIf { com.example.ui.components.isValidPlayableMediaUrl(it) }
+
+            com.example.extension.managed.trace.Phase05GLogger.log(
+                "SERVERS",
+                mediaId,
+                "Discovered ${serverItems.size} servers (${serversNames.joinToString(", ")}), website=$website"
+            )
         }
 
-        // If direct stream URL is not yet resolved, check direct links in serversMap / downloadsMap
+        // If direct stream URL is not yet resolved, check direct links in serversMap / downloadsMap (ensuring valid media URL)
         if (directStreamUrl.isNullOrBlank()) {
             val directLink = serversMap.values.firstOrNull {
                 it.contains(".m3u8") || it.contains(".mp4") || it.contains("akamaized.net")
             } ?: downloadsMap.values.firstOrNull {
                 it.contains(".m3u8") || it.contains(".mp4") || it.contains("akamaized.net")
             }
-            if (!directLink.isNullOrBlank()) {
+            if (!directLink.isNullOrBlank() && com.example.ui.components.isValidPlayableMediaUrl(directLink)) {
                 directStreamUrl = directLink
+                com.example.extension.managed.trace.Phase05GLogger.log("VARIANT", mediaId, "Direct playable stream link found in server map: $directStreamUrl")
             }
         }
 
@@ -1253,15 +1296,37 @@ object ServerStateStore {
             val candidateServers = serverItems.filter { !isPureDownloadOnly(it) }.take(3)
             for (srv in candidateServers) {
                 try {
+                    com.example.extension.managed.trace.Phase05GLogger.log(
+                        "EXTRACTION",
+                        mediaId,
+                        "Starting extraction for candidate server: ${srv.name} (${srv.link})"
+                    )
                     val extractResult = managedOrchestrator.extractPlaybackSource(srv, title)
                     if (extractResult.isSuccess) {
                         val stream = extractResult.getOrThrow().streamUrl
-                        if (stream.isNotBlank()) {
+                        if (stream.isNotBlank() && com.example.ui.components.isValidPlayableMediaUrl(stream)) {
                             directStreamUrl = stream
+                            com.example.extension.managed.trace.Phase05GLogger.log(
+                                "EXTRACTION",
+                                mediaId,
+                                "Extraction success on server ${srv.name}: $stream"
+                            )
                             break
                         }
+                    } else {
+                        com.example.extension.managed.trace.Phase05GLogger.log(
+                            "EXTRACTION",
+                            mediaId,
+                            "Extraction failed on server ${srv.name}: ${extractResult.exceptionOrNull()?.message}"
+                        )
                     }
-                } catch (_: Throwable) {}
+                } catch (e: Throwable) {
+                    com.example.extension.managed.trace.Phase05GLogger.log(
+                        "EXTRACTION",
+                        mediaId,
+                        "Extraction exception on server ${srv.name}: ${e.message}"
+                    )
+                }
             }
         }
 
@@ -1289,6 +1354,12 @@ object ServerStateStore {
             altKeys = allAltKeys,
             directStreamUrl = directStreamUrl,
             mediaId = mediaId
+        )
+
+        com.example.extension.managed.trace.Phase05GLogger.log(
+            "VARIANT",
+            mediaId,
+            "Resolved directStreamUrl=${directStreamUrl ?: "none"}, qualitiesCount=${resolvedQualities.size}"
         )
 
         return getCachedData(mediaKey, *allAltKeys.toTypedArray())

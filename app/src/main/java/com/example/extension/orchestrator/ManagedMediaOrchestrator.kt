@@ -307,6 +307,14 @@ class ManagedMediaOrchestrator(
             userEnabled = true
         )
 
+        val BUNDLED_DEFAULT_EXTENSIONS = listOf(
+            DEFAULT_QFILM_MANAGED_EXTENSION,
+            DEFAULT_EGYDEAD_MANAGED_EXTENSION,
+            DEFAULT_WITANIME_MANAGED_EXTENSION,
+            DEFAULT_ANIME4UP_MANAGED_EXTENSION,
+            DEFAULT_ANIMEBLKOM_MANAGED_EXTENSION
+        )
+
         @Volatile
         private var instance: ManagedMediaOrchestrator? = null
         private val isInitialized = AtomicBoolean(false)
@@ -329,7 +337,8 @@ class ManagedMediaOrchestrator(
             val repo = DefaultManagedExtensionRepository(
                 remoteDataSource = remoteSource,
                 cache = cache,
-                userPreferences = userPrefs
+                userPreferences = userPrefs,
+                bundledDefaults = BUNDLED_DEFAULT_EXTENSIONS
             )
             val registry = ManagedExtensionRegistry.INSTANCE
 
@@ -447,12 +456,49 @@ class ManagedMediaOrchestrator(
             if (result.isSuccess) {
                 val freshList = result.getOrNull() ?: emptyList()
                 if (freshList.isNotEmpty()) {
-                    registry.setExtensions(freshList)
+                    // Strict remote validation gate before updating registry per FIX 3
+                    val validatedList = freshList.filter { ext ->
+                        com.example.extension.managed.model.ManagedExtensionValidator.validateRemoteEntry(
+                            extension = ext,
+                            currentAppVersionCode = runtime.currentAppVersionCode
+                        ) is com.example.extension.managed.model.ManagedExtensionValidator.ValidationResult.Valid
+                    }
+                    if (validatedList.isNotEmpty()) {
+                        registry.setExtensions(validatedList)
+                        com.example.extension.managed.trace.Phase05GLogger.log(
+                            "REGISTRY",
+                            "orchestrator",
+                            "Updated registry with ${validatedList.size} validated extensions"
+                        )
+                    } else {
+                        com.example.extension.managed.trace.Phase05GLogger.log(
+                            "REGISTRY",
+                            "orchestrator",
+                            "Remote extensions rejected by validation gate; keeping existing healthy registry"
+                        )
+                    }
+                } else {
+                    // Genuine empty list from remote
+                    com.example.extension.managed.trace.Phase05GLogger.log(
+                        "REGISTRY",
+                        "orchestrator",
+                        "Remote catalog returned 0 extensions (genuine empty)"
+                    )
                 }
+            } else {
+                com.example.extension.managed.trace.Phase05GLogger.log(
+                    "FIREBASE",
+                    "orchestrator",
+                    "forceRefresh repository error: ${result.exceptionOrNull()?.message}; keeping existing registry"
+                )
             }
             searchOrderRepository.getSearchOrder(forceRefresh = true)
-        } catch (_: Exception) {
-            // Ignore transient network errors, keep cached/bundled extensions
+        } catch (e: Exception) {
+            com.example.extension.managed.trace.Phase05GLogger.log(
+                "FIREBASE",
+                "orchestrator",
+                "forceRefresh exception: ${e.message}; keeping existing registry"
+            )
         }
     }
 

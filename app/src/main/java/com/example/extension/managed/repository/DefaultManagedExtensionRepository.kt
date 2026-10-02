@@ -19,7 +19,8 @@ import java.io.IOException
 class DefaultManagedExtensionRepository(
     private val remoteDataSource: ManagedExtensionRemoteDataSource,
     private val cache: ManagedExtensionCache = SafeLocalMetadataCache(),
-    private val userPreferences: ExtensionUserPreferences = InMemoryExtensionUserPreferences()
+    private val userPreferences: ExtensionUserPreferences = InMemoryExtensionUserPreferences(),
+    private val bundledDefaults: List<ManagedExtension> = emptyList()
 ) : ManagedExtensionRepository {
 
     override suspend fun getExtensions(forceRefresh: Boolean): Result<List<ManagedExtension>> =
@@ -27,11 +28,11 @@ class DefaultManagedExtensionRepository(
             // 1. Check cache if not forcing refresh
             if (!forceRefresh && !cache.isExpired()) {
                 val cached = cache.getCached()
-                if (cached != null) {
-                    // Update user preference states in cached items
+                if (cached != null && cached.isNotEmpty()) {
                     val updatedWithPreferences = cached.map { ext ->
                         ext.copy(userEnabled = userPreferences.isExtensionEnabled(ext.id))
                     }
+                    com.example.extension.managed.trace.Phase05GLogger.log("CACHE", "repo", "Cache hit with ${cached.size} items")
                     return@withContext Result.success(updatedWithPreferences)
                 }
             }
@@ -41,47 +42,121 @@ class DefaultManagedExtensionRepository(
 
             if (remoteResult.isSuccess) {
                 val dtos = remoteResult.getOrNull() ?: emptyList()
+                com.example.extension.managed.trace.Phase05GLogger.log("REMOTE_COUNT", "repo", "Received ${dtos.size} DTOs from Firestore")
+
+                if (dtos.isEmpty()) {
+                    // Genuine empty catalog from remote
+                    cache.saveCache(emptyList())
+                    return@withContext Result.success(emptyList())
+                }
+
                 val validExtensions = mutableListOf<ManagedExtension>()
+                val rejectedIds = mutableSetOf<String>()
 
                 for (dto in dtos) {
                     val localEnabled = userPreferences.isExtensionEnabled(dto.id.orEmpty())
                     val domainExt = ManagedExtensionMapper.toDomain(dto, localUserEnabled = localEnabled)
 
-                    // Gate: strict validation
-                    when (val validation = ManagedExtensionValidator.validate(domainExt)) {
+                    // Gate: strict validation per Phase 05G FIX 3
+                    when (val validation = ManagedExtensionValidator.validateRemoteEntry(domainExt)) {
                         is ManagedExtensionValidator.ValidationResult.Valid -> {
                             validExtensions.add(domainExt)
                         }
                         is ManagedExtensionValidator.ValidationResult.Invalid -> {
-                            // Safely skip malformed/untrusted remote documents without crashing the pipeline
+                            val id = domainExt.id
+                            if (id.isNotBlank()) {
+                                rejectedIds.add(id)
+                            }
+                            com.example.extension.managed.trace.Phase05GLogger.log(
+                                "VALIDATED_COUNT",
+                                id.ifBlank { "unknown" },
+                                "Rejected remote document: ${validation.error}"
+                            )
                         }
                     }
                 }
 
-                // Deterministic deduplication: if duplicate IDs exist, retain the one with newest updatedAt or higher priority
-                val deduplicated = validExtensions
+                // If remote sent documents, but ALL were invalid/incompatible -> structurally unusable remote configuration
+                if (validExtensions.isEmpty() && dtos.isNotEmpty()) {
+                    com.example.extension.managed.trace.Phase05GLogger.log(
+                        "VALIDATED_COUNT",
+                        "repo",
+                        "All ${dtos.size} remote documents rejected; falling back to healthy cache / bundled defaults"
+                    )
+                    val cachedFallback = cache.getCached()
+                    if (cachedFallback != null && cachedFallback.isNotEmpty()) {
+                        return@withContext Result.success(cachedFallback.map { ext ->
+                            ext.copy(userEnabled = userPreferences.isExtensionEnabled(ext.id))
+                        })
+                    }
+                    if (bundledDefaults.isNotEmpty()) {
+                        return@withContext Result.success(bundledDefaults.map { ext ->
+                            ext.copy(userEnabled = userPreferences.isExtensionEnabled(ext.id))
+                        })
+                    }
+                }
+
+                // Deterministic deduplication
+                val deduplicatedValid = validExtensions
                     .groupBy { it.id }
                     .map { (_, group) ->
                         group.maxWithOrNull(compareBy({ it.updatedAt }, { it.priority })) ?: group.first()
                     }
-                    .sortedByDescending { it.priority }
+
+                // For partially invalid remote documents: retain healthy candidate if remote was rejected
+                val finalCatalog = mutableListOf<ManagedExtension>()
+                finalCatalog.addAll(deduplicatedValid)
+
+                for (rejectedId in rejectedIds) {
+                    // Do not allow an invalid remote document to destroy a healthy bundled runtime candidate
+                    val healthyCandidate = bundledDefaults.firstOrNull { it.id == rejectedId }
+                    if (healthyCandidate != null && finalCatalog.none { it.id == rejectedId }) {
+                        finalCatalog.add(healthyCandidate.copy(userEnabled = userPreferences.isExtensionEnabled(rejectedId)))
+                    }
+                }
+
+                finalCatalog.sortByDescending { it.priority }
+
+                com.example.extension.managed.trace.Phase05GLogger.log(
+                    "VALIDATED_COUNT",
+                    "repo",
+                    "Final catalog contains ${finalCatalog.size} extensions (validRemote=${deduplicatedValid.size}, retainedHealthyCandidates=${finalCatalog.size - deduplicatedValid.size})"
+                )
 
                 // Save validated items to cache
-                cache.saveCache(deduplicated)
+                cache.saveCache(finalCatalog)
 
-                return@withContext Result.success(deduplicated)
+                return@withContext Result.success(finalCatalog)
             }
 
-            // 3. Fallback to cache on remote failure (e.g. offline/network failure)
+            // 3. Fallback to cache on remote failure (e.g. offline/network failure/permission error)
+            com.example.extension.managed.trace.Phase05GLogger.log(
+                "FIREBASE",
+                "repo",
+                "Remote fetch failed: ${remoteResult.exceptionOrNull()?.message}; attempting fallback"
+            )
             val cachedFallback = cache.getCached()
-            if (cachedFallback != null) {
+            if (cachedFallback != null && cachedFallback.isNotEmpty()) {
                 val updatedWithPreferences = cachedFallback.map { ext ->
                     ext.copy(userEnabled = userPreferences.isExtensionEnabled(ext.id))
                 }
                 return@withContext Result.success(updatedWithPreferences)
             }
 
-            // 4. No cache available -> map remote failure to domain ExtensionError
+            // 4. Fallback to bundled defaults when no cache is available on remote failure
+            if (bundledDefaults.isNotEmpty()) {
+                com.example.extension.managed.trace.Phase05GLogger.log(
+                    "REGISTRY",
+                    "repo",
+                    "No cache available; falling back to ${bundledDefaults.size} bundled defaults"
+                )
+                val updatedDefaults = bundledDefaults.map { ext ->
+                    ext.copy(userEnabled = userPreferences.isExtensionEnabled(ext.id))
+                }
+                return@withContext Result.success(updatedDefaults)
+            }
+
+            // 5. No cache and no bundled defaults available -> map remote failure to domain ExtensionError
             val error = remoteResult.exceptionOrNull()
             val domainError = mapToDomainError(error)
             Result.failure(domainError)
